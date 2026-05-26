@@ -86,6 +86,7 @@ async def run(
     user_email: str,
     user_message: str,
     slack_context: dict | None = None,
+    images: list[dict] | None = None,
 ) -> str:
     """
     Ejecuta el loop completo de tool use de Claude.
@@ -93,7 +94,7 @@ async def run(
     user_email: identidad del usuario (para impersonation Drive/Calendar)
     user_message: texto del @mention
     slack_context: dict con channel_id, thread_ts, channel_name, user_name
-                   (se inyecta al primer mensaje para que Claude sepa dónde está)
+    images: lista de content blocks tipo image (base64) para Claude vision
     """
     client = _client()
     tools = all_specs()
@@ -139,9 +140,20 @@ async def run(
 
     full_message = ("\n".join(ctx_lines) + user_message).strip()
 
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": full_message},
-    ]
+    # Si hay imágenes, construir content multimodal: texto + image blocks
+    if images:
+        log.info("Mensaje incluye %d imagen(es)", len(images))
+        content_blocks: list[dict[str, Any]] = [
+            {"type": "text", "text": full_message}
+        ]
+        content_blocks.extend(images)
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": content_blocks},
+        ]
+    else:
+        messages = [
+            {"role": "user", "content": full_message},
+        ]
 
     for turn in range(MAX_TOOL_TURNS):
         log.info("Turn %d, mensajes=%d", turn, len(messages))

@@ -7,10 +7,12 @@ y responde en el hilo con contexto del thread completo.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
 
+import httpx
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.starlette.async_handler import AsyncSlackRequestHandler
 
@@ -18,6 +20,11 @@ from mafe_agentic import agent_brain
 from mafe_agentic.identity import resolve_email
 
 log = logging.getLogger(__name__)
+
+# Tipos de imagen que Claude puede procesar
+SUPPORTED_IMAGE_MIME = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
+MAX_IMAGES_PER_MESSAGE = 5
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
 # ----- Bolt App (lazy init para que el import no falle sin tokens) -----
@@ -77,6 +84,60 @@ async def _resolve_user_name(client, user_id: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+async def _download_image(file_info: dict) -> dict | None:
+    """
+    Descarga una imagen de Slack y la devuelve como base64 lista para Claude.
+    Slack files son privados, requieren Bot Token como Bearer.
+    """
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    mime = (file_info.get("mimetype") or "").lower()
+    name = file_info.get("name", "imagen")
+
+    if not url or mime not in SUPPORTED_IMAGE_MIME:
+        return None
+
+    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not bot_token or bot_token.startswith("_not_"):
+        return None
+
+    headers = {"Authorization": f"Bearer {bot_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            content = resp.content
+            if len(content) > MAX_IMAGE_BYTES:
+                log.warning("Imagen %s muy grande (%d bytes), saltando", name, len(content))
+                return None
+            b64 = base64.standard_b64encode(content).decode("ascii")
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime,
+                    "data": b64,
+                },
+            }
+    except Exception as e:
+        log.warning("No pude bajar imagen %s: %s", name, e)
+        return None
+
+
+async def _extract_images(event: dict) -> list[dict]:
+    """Saca imágenes adjuntas del evento de Slack y las prepara para Claude."""
+    files = event.get("files") or []
+    if not files:
+        return []
+    images = []
+    for f in files[:MAX_IMAGES_PER_MESSAGE]:
+        img = await _download_image(f)
+        if img:
+            images.append(img)
+    if images:
+        log.info("Adjuntando %d imagen(es) al mensaje", len(images))
+    return images
 
 
 async def _fetch_thread_history(
@@ -167,6 +228,9 @@ async def on_app_mention(event, client, say, logger):
     )
     log.info("Historia del hilo: %d mensajes previos", len(thread_history))
 
+    # Extraer imágenes adjuntas (si las hay)
+    images = await _extract_images(event)
+
     slack_context = {
         "channel_id": channel_id,
         "channel_name": channel_name,
@@ -189,6 +253,7 @@ async def on_app_mention(event, client, say, logger):
             user_email=user_email,
             user_message=text,
             slack_context=slack_context,
+            images=images,
         )
     except Exception as e:
         log.exception("agent_brain falló: %s", e)
