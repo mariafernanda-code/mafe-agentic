@@ -2,12 +2,7 @@
 Handler de Slack Events API.
 
 Recibe @menciones del bot, identifica al usuario, dispara el cerebro
-y responde en el hilo. Verifica la firma de Slack para asegurar que el
-request viene de Slack y no de un atacante.
-
-Endpoints expuestos por la app Starlette:
-    POST /slack/events       — events API (handled by Bolt)
-    GET  /slack/install      — opcional, instalación OAuth (no usado por ahora)
+y responde en el hilo con contexto del thread completo.
 """
 
 from __future__ import annotations
@@ -27,9 +22,6 @@ log = logging.getLogger(__name__)
 
 # ----- Bolt App (lazy init para que el import no falle sin tokens) -----
 
-# Placeholder NO-secret para que la inicialización no rompa antes de que
-# Railway inyecte las variables reales. Es texto literal con guion bajo,
-# no matchea ningún pattern de Slack token real.
 _PLACEHOLDER_TOKEN = "_not_configured_yet_"
 _PLACEHOLDER_SECRET = "_not_configured_yet_"
 
@@ -46,7 +38,6 @@ def _strip_mention(text: str) -> str:
 
 
 async def _resolve_channel_name(client, channel_id: str) -> str | None:
-    """Intenta obtener el nombre del canal para incluir en contexto."""
     try:
         resp = await client.conversations_info(channel=channel_id)
         if resp.get("ok"):
@@ -57,7 +48,6 @@ async def _resolve_channel_name(client, channel_id: str) -> str | None:
 
 
 async def _resolve_user_name(client, user_id: str) -> str | None:
-    """Intenta obtener el nombre del usuario."""
     try:
         resp = await client.users_info(user=user_id)
         if resp.get("ok"):
@@ -68,27 +58,68 @@ async def _resolve_user_name(client, user_id: str) -> str | None:
     return None
 
 
+async def _fetch_thread_history(
+    client, channel_id: str, thread_ts: str, current_ts: str
+) -> list[dict]:
+    """
+    Lee los mensajes anteriores del hilo para que Mafe tenga contexto.
+    Excluye el mensaje actual (current_ts) que es el que dispara la llamada.
+    Devuelve lista de {user, text, is_bot, ts} en orden cronológico.
+    """
+    if not thread_ts or thread_ts == current_ts:
+        return []  # no hay historia previa, este es el primer mensaje del hilo
+
+    try:
+        resp = await client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            limit=30,
+        )
+        if not resp.get("ok"):
+            return []
+        msgs = []
+        for m in resp.get("messages", []):
+            ts = m.get("ts", "")
+            if ts == current_ts:
+                continue  # no incluir el mensaje actual
+            text = _strip_mention(m.get("text", ""))
+            if not text:
+                continue
+            msgs.append({
+                "user": m.get("user") or m.get("bot_id") or "system",
+                "text": text,
+                "is_bot": bool(m.get("bot_id")) or m.get("subtype") == "bot_message",
+                "ts": ts,
+            })
+        return msgs
+    except Exception as e:
+        log.warning("No pude leer historia del hilo: %s", e)
+        return []
+
+
 # ----- Event: app_mention -----
 
 @bolt_app.event("app_mention")
 async def on_app_mention(event, client, say, logger):
     """
-    Mafe fue @mencionada en un canal.
-    Identifica al usuario, dispara el cerebro, responde en hilo.
+    Mafe fue @mencionada. Lee contexto del hilo, dispara cerebro, responde.
     """
     slack_user_id = event.get("user", "")
     channel_id = event.get("channel", "")
-    thread_ts = event.get("thread_ts") or event.get("ts")
+    event_ts = event.get("ts", "")
+    thread_ts = event.get("thread_ts") or event_ts
     text = _strip_mention(event.get("text", ""))
 
     log.info(
-        "@mention de %s en %s: %s",
-        slack_user_id, channel_id, text[:80]
+        "@mention de %s en %s (thread=%s): %s",
+        slack_user_id, channel_id, thread_ts, text[:80]
     )
+
+    user_mention = f"<@{slack_user_id}>" if slack_user_id else ""
 
     if not text:
         await say(
-            text="Aquí estoy. ¿En qué te ayudo? Puedo leer canales, crear presentaciones, programar juntas, hacer Canvas, listas, y más.",
+            text=f"{user_mention} Aquí estoy 👋 ¿En qué te ayudo? Puedo leer canales, hacer presentaciones, programar juntas, crear Canvas y listas, y más.",
             thread_ts=thread_ts,
         )
         return
@@ -98,7 +129,7 @@ async def on_app_mention(event, client, say, logger):
     if not user_email:
         await say(
             text=(
-                "Quería ayudarte pero no logré identificar tu correo en Slack. "
+                f"{user_mention} Quería ayudarte pero no logré identificar tu correo en Slack. "
                 "Pídele al admin del workspace que active la visibilidad de email del perfil."
             ),
             thread_ts=thread_ts,
@@ -108,18 +139,26 @@ async def on_app_mention(event, client, say, logger):
     # Contexto extra
     channel_name = await _resolve_channel_name(client, channel_id)
     user_name = await _resolve_user_name(client, slack_user_id)
+
+    # Leer historia del hilo (mensajes previos, sin el actual)
+    thread_history = await _fetch_thread_history(
+        client, channel_id, thread_ts, event_ts
+    )
+    log.info("Historia del hilo: %d mensajes previos", len(thread_history))
+
     slack_context = {
         "channel_id": channel_id,
         "channel_name": channel_name,
         "thread_ts": thread_ts,
         "user_id": slack_user_id,
         "user_name": user_name,
+        "thread_history": thread_history,
     }
 
     # Avisar que está trabajando si la tarea suena pesada
-    if any(w in text.lower() for w in ("resumen", "lee", "revisa", "presentación", "deck", "propuesta")):
+    if any(w in text.lower() for w in ("resumen", "lee", "revisa", "presentación", "deck", "propuesta", "copia", "plantilla")):
         try:
-            await say(text="Va, trabajando en eso…", thread_ts=thread_ts)
+            await say(text=f"{user_mention} Va, trabajando en eso ✨", thread_ts=thread_ts)
         except Exception:
             pass
 
@@ -133,12 +172,17 @@ async def on_app_mention(event, client, say, logger):
     except Exception as e:
         log.exception("agent_brain falló: %s", e)
         reply = (
-            f"Algo se me atravesó por dentro. Detalle: {type(e).__name__}: {e}. "
+            f"Algo se me atravesó por dentro 😅 Detalle técnico: {type(e).__name__}: {e}. "
             "¿Lo intentamos de nuevo?"
         )
 
+    # Anteponer @-mención si no la incluye ya
+    final_reply = reply
+    if user_mention and user_mention not in reply[:50]:
+        final_reply = f"{user_mention} {reply}"
+
     # Postear respuesta final en el hilo
-    await say(text=reply, thread_ts=thread_ts)
+    await say(text=final_reply, thread_ts=thread_ts)
 
 
 # ----- Handler Starlette para mount en server.py -----

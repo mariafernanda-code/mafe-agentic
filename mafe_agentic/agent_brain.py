@@ -75,7 +75,7 @@ async def run(
     # Mensaje inicial enriquecido con contexto Slack
     ctx_lines = []
     if slack_context:
-        ctx_lines.append(f"[Contexto: estás respondiendo en Slack.")
+        ctx_lines.append("[Contexto: estás respondiendo en Slack.")
         if slack_context.get("channel_name"):
             ctx_lines.append(f"Canal: #{slack_context['channel_name']} (ID {slack_context.get('channel_id')})")
         else:
@@ -87,6 +87,22 @@ async def run(
         if slack_context.get("thread_ts"):
             ctx_lines.append(f"Hilo: {slack_context['thread_ts']}")
         ctx_lines.append("]")
+
+        # Incluir historia del hilo si existe
+        history = slack_context.get("thread_history") or []
+        if history:
+            ctx_lines.append("")
+            ctx_lines.append("[Historia del hilo (mensajes previos, en orden):")
+            for h in history:
+                who = "Tú (Mafe Agentic)" if h.get("is_bot") else h.get("user", "alguien")
+                txt = h.get("text", "")
+                # Truncar mensajes largos en el contexto
+                if len(txt) > 500:
+                    txt = txt[:500] + "..."
+                ctx_lines.append(f"  - {who}: {txt}")
+            ctx_lines.append("]")
+            ctx_lines.append("Lee toda la historia antes de responder. Mantén la continuidad: si ya te pidieron algo arriba, no preguntes de nuevo lo mismo.")
+
         ctx_lines.append("")
 
     full_message = ("\n".join(ctx_lines) + user_message).strip()
