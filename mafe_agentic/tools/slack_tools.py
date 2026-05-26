@@ -73,6 +73,48 @@ async def read_thread(
     return {"channel": channel_id, "thread_ts": thread_ts, "messages": msgs}
 
 
+# ----- Tool: buscar usuarios por nombre -----
+
+async def lookup_users(
+    *, user_email: str, query: str, limit: int = 10
+) -> dict:
+    """
+    Busca usuarios en el workspace por nombre, display name o email parcial.
+    Devuelve la lista con id, real_name, display_name, email.
+    Útil para encontrar el correo de "Christian Hernandez" cuando vas a agendar
+    una junta con él.
+    """
+    client = _client()
+    resp = await client.users_list(limit=200)
+    if not resp.get("ok"):
+        raise RuntimeError(f"Slack rechazó users.list: {resp.get('error')}")
+
+    q = (query or "").lower().strip()
+    matches = []
+    for u in resp.get("members", []):
+        if u.get("deleted") or u.get("is_bot"):
+            continue
+        profile = u.get("profile", {})
+        candidates = [
+            u.get("name", ""),
+            u.get("real_name", ""),
+            profile.get("real_name", ""),
+            profile.get("display_name", ""),
+            profile.get("email", ""),
+        ]
+        text = " ".join(candidates).lower()
+        if q in text:
+            matches.append({
+                "id": u.get("id"),
+                "name": u.get("real_name") or profile.get("real_name") or u.get("name"),
+                "display_name": profile.get("display_name"),
+                "email": profile.get("email"),
+            })
+            if len(matches) >= limit:
+                break
+    return {"query": query, "count": len(matches), "users": matches}
+
+
 # ----- Tool: buscar en workspace -----
 
 async def search_messages(
@@ -201,6 +243,23 @@ SPECS = [
         },
     },
     {
+        "name": "slack_lookup_users",
+        "description": (
+            "Busca usuarios del workspace por nombre, display name o email. "
+            "OBLIGATORIO usar esto cuando alguien mencione a otra persona por nombre "
+            "(ej: 'agenda con Christian Hernandez') para obtener su correo de Google Workspace, "
+            "que luego usas en calendar_create_event como attendee."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Nombre o parte del nombre (ej: 'Christian', 'Maria Fernanda')"},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "slack_search",
         "description": "Busca mensajes en el workspace que contengan un query (texto, from:user, in:#canal, etc.).",
         "input_schema": {
@@ -244,6 +303,7 @@ SPECS = [
 DISPATCH = {
     "slack_read_channel": read_channel,
     "slack_read_thread": read_thread,
+    "slack_lookup_users": lookup_users,
     "slack_search": search_messages,
     "slack_create_canvas": create_canvas,
     "slack_create_list": create_list,
