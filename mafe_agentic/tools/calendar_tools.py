@@ -158,6 +158,69 @@ async def create_event(
     }
 
 
+# ----- Tool: actualizar evento existente -----
+
+async def update_event(
+    *, user_email: str, event_id: str,
+    summary: str | None = None, start_iso: str | None = None,
+    end_iso: str | None = None, description: str | None = None,
+    attendees: list[str] | None = None, location: str | None = None,
+) -> dict:
+    """
+    Actualiza un evento existente. Solo se modifican los campos que pases.
+    Mantiene el link de Meet original (no se regenera).
+    """
+    svc = _calendar_service(user_email)
+
+    # Leer el evento actual para hacer un patch parcial
+    event = svc.events().get(calendarId="primary", eventId=event_id).execute()
+
+    if summary is not None:
+        event["summary"] = summary
+    if description is not None:
+        event["description"] = description
+    if location is not None:
+        event["location"] = location
+    if start_iso is not None:
+        event["start"] = {"dateTime": start_iso}
+    if end_iso is not None:
+        event["end"] = {"dateTime": end_iso}
+    if attendees is not None:
+        event["attendees"] = [{"email": e} for e in attendees]
+
+    updated = svc.events().update(
+        calendarId="primary",
+        eventId=event_id,
+        body=event,
+        sendUpdates="all" if event.get("attendees") else "none",
+    ).execute()
+
+    return {
+        "id": updated.get("id"),
+        "summary": updated.get("summary"),
+        "start": updated.get("start", {}).get("dateTime"),
+        "end": updated.get("end", {}).get("dateTime"),
+        "meet_link": updated.get("hangoutLink"),
+        "html_link": updated.get("htmlLink"),
+        "attendees": [a.get("email") for a in updated.get("attendees", [])],
+    }
+
+
+# ----- Tool: borrar evento -----
+
+async def delete_event(
+    *, user_email: str, event_id: str, notify_attendees: bool = True
+) -> dict:
+    """Borra un evento del calendario. Notifica a los asistentes si los hay."""
+    svc = _calendar_service(user_email)
+    svc.events().delete(
+        calendarId="primary",
+        eventId=event_id,
+        sendUpdates="all" if notify_attendees else "none",
+    ).execute()
+    return {"deleted": True, "event_id": event_id}
+
+
 # ----- Specs -----
 
 SPECS = [
@@ -218,8 +281,47 @@ SPECS = [
 ]
 
 
+SPECS.append({
+    "name": "calendar_update_event",
+    "description": (
+        "Actualiza un evento existente (cambia título, fecha, descripción, asistentes). "
+        "Úsalo cuando te digan 'cambia la junta', 'actualiza la junta', 'pon mejor a las 11', etc. "
+        "NO crees una junta nueva, actualiza la existente. "
+        "Si no tienes el event_id, primero llama calendar_list_events para obtenerlo."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "ID del evento (de calendar_list_events)"},
+            "summary": {"type": "string", "description": "Nuevo título (opcional)"},
+            "start_iso": {"type": "string", "description": "Nueva fecha de inicio ISO 8601 con zona (opcional)"},
+            "end_iso": {"type": "string", "description": "Nueva fecha de fin ISO 8601 con zona (opcional)"},
+            "description": {"type": "string", "description": "Nueva descripción (opcional)"},
+            "attendees": {"type": "array", "items": {"type": "string"}, "description": "Lista completa de attendees (reemplaza la existente)"},
+            "location": {"type": "string"},
+        },
+        "required": ["event_id"],
+    },
+})
+
+SPECS.append({
+    "name": "calendar_delete_event",
+    "description": "Borra un evento del calendario. Úsalo cuando te digan 'cancela', 'borra', 'elimina la junta'. Notifica a los attendees por default.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string"},
+            "notify_attendees": {"type": "boolean", "default": True},
+        },
+        "required": ["event_id"],
+    },
+})
+
+
 DISPATCH = {
     "calendar_list_events": list_events,
     "calendar_find_free_slots": find_free_slots,
     "calendar_create_event": create_event,
+    "calendar_update_event": update_event,
+    "calendar_delete_event": delete_event,
 }
