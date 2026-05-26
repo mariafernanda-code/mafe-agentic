@@ -14,7 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from anthropic import AsyncAnthropic
 
@@ -26,6 +28,30 @@ log = logging.getLogger(__name__)
 MODEL = os.environ.get("MAFE_MODEL", "claude-sonnet-4-5")
 MAX_TOOL_TURNS = 10
 MAX_TOKENS = 4096
+
+# Zona horaria por default (CDMX, donde está Golden Gate Grid)
+TIMEZONE = os.environ.get("MAFE_TIMEZONE", "America/Mexico_City")
+
+
+def _today_context() -> str:
+    """Genera contexto temporal para que Claude sepa qué día es hoy."""
+    try:
+        tz = ZoneInfo(TIMEZONE)
+    except Exception:
+        tz = ZoneInfo("America/Mexico_City")
+    now = datetime.now(tz)
+    weekdays = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    months = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+              "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    day_name = weekdays[now.weekday()]
+    month_name = months[now.month - 1]
+    return (
+        f"Hoy es {day_name} {now.day} de {month_name} de {now.year}, "
+        f"{now.strftime('%H:%M')} hora de Ciudad de México ({TIMEZONE}). "
+        f"Cuando el usuario diga 'mañana', 'el viernes', 'la próxima semana', "
+        f"calcúlalo desde esta fecha. Formato ISO para Calendar: "
+        f"{now.strftime('%Y-%m-%dT%H:%M:%S')}-06:00 (offset CDMX)."
+    )
 
 
 def _client() -> AsyncAnthropic:
@@ -72,8 +98,14 @@ async def run(
     client = _client()
     tools = all_specs()
 
-    # Mensaje inicial enriquecido con contexto Slack
+    # Mensaje inicial enriquecido con contexto temporal + Slack
     ctx_lines = []
+
+    # Inyectar fecha actual SIEMPRE (Claude no la sabe por sí mismo)
+    ctx_lines.append("[Fecha y hora actual]")
+    ctx_lines.append(_today_context())
+    ctx_lines.append("")
+
     if slack_context:
         ctx_lines.append("[Contexto: estás respondiendo en Slack.")
         if slack_context.get("channel_name"):
