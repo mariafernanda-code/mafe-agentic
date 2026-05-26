@@ -37,6 +37,27 @@ def _strip_mention(text: str) -> str:
     return re.sub(r"^<@[A-Z0-9]+>\s*", "", text).strip()
 
 
+def _slackify(text: str) -> str:
+    """
+    Convierte markdown estilo Claude a markdown que Slack renderiza bien.
+    Slack NO entiende **bold** ni *italic* normales, usa *bold* y _italic_.
+    Para evitar inconsistencias y la fealdad de ** crudos, limpiamos:
+    - **bold** → *bold*  (Slack lo renderiza como bold)
+    - __bold__ → *bold*
+    - Quitamos headers de Markdown (# Titulo → Titulo)
+    """
+    if not text:
+        return text
+    # Quitar headers Markdown (# Titulo, ## Subtitulo, etc.)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Convertir **bold** y __bold__ a *bold* (formato Slack)
+    text = re.sub(r"\*\*([^*\n]+?)\*\*", r"*\1*", text)
+    text = re.sub(r"__([^_\n]+?)__", r"*\1*", text)
+    # Quitar enlaces Markdown raros tipo [texto](url) → texto: url
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", text)
+    return text.strip()
+
+
 async def _resolve_channel_name(client, channel_id: str) -> str | None:
     try:
         resp = await client.conversations_info(channel=channel_id)
@@ -175,6 +196,9 @@ async def on_app_mention(event, client, say, logger):
             f"Algo se me atravesó por dentro 😅 Detalle técnico: {type(e).__name__}: {e}. "
             "¿Lo intentamos de nuevo?"
         )
+
+    # Limpiar markdown estilo Claude que Slack no renderiza bien
+    reply = _slackify(reply)
 
     # Anteponer @-mención si no la incluye ya
     final_reply = reply
