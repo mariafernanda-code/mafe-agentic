@@ -150,8 +150,33 @@ async def create_event(
     *, user_email: str, summary: str, start_iso: str, end_iso: str,
     attendees: list[str] | None = None, description: str | None = None,
     location: str | None = None, with_meet: bool = True,
+    allow_weekend: bool = False,
 ) -> dict:
-    """Crea un evento en Calendar. with_meet=True genera link de Meet automático."""
+    """Crea un evento en Calendar. with_meet=True genera link de Meet automático.
+
+    Por default NO permite crear eventos en sábado/domingo. Si Claude tiene
+    que crearlos en fin de semana porque el usuario lo pidió explícito,
+    debe pasar allow_weekend=True.
+    """
+    # Validar que no caiga en fin de semana
+    if not allow_weekend:
+        try:
+            start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+            if start_dt.weekday() >= 5:  # sábado=5, domingo=6
+                day_name = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][start_dt.weekday()]
+                return {
+                    "error": (
+                        f"La fecha {start_iso[:10]} es {day_name} (fin de semana). "
+                        f"Por política no agendo juntas en fin de semana salvo que se pida explícito. "
+                        f"Recalcula a un día hábil (lunes-viernes) y vuelve a intentar. "
+                        f"Si el usuario SÍ lo quiere en fin de semana, pasa allow_weekend=True."
+                    ),
+                    "weekend": True,
+                    "day": day_name,
+                }
+        except Exception as e:
+            log.warning("No pude validar start_iso: %s", e)
+
     svc = _calendar_service(user_email)
 
     body = {
@@ -315,6 +340,11 @@ SPECS = [
                     "type": "boolean",
                     "default": True,
                     "description": "Si True, agrega link de Meet auto",
+                },
+                "allow_weekend": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Por default no agendo en fin de semana. Pásame True solo si el usuario lo pidió explícitamente.",
                 },
             },
             "required": ["summary", "start_iso", "end_iso"],
