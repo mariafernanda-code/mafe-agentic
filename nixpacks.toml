@@ -1,0 +1,11 @@
+# Configuración de build para Railway/Nixpacks.
+# Incluye graphviz a nivel sistema para los diagramas de flujo.
+
+[phases.setup]
+nixPkgs = ["python311", "graphviz"]
+
+[phases.install]
+cmds = ["pip install -e ."]
+
+[start]
+cmd = "python -m mafe_agentic.server"

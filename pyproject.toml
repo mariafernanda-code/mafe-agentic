@@ -1,0 +1,29 @@
+[project]
+name = "mafe-agentic"
+version = "0.1.0"
+description = "Mafe Agentic: el MCP server agéntico de Golden Gate Grid. Multi-usuario, hospedado, con todo el poder de Mariana ahora servido como API."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Golden Gate Grid" }]
+dependencies = [
+    "mcp>=1.2.0",
+    "pydantic>=2.5.0",
+    "python-pptx>=1.0.2",
+    "openpyxl>=3.1.5",
+    "matplotlib>=3.9.0",
+    "graphviz>=0.20.3",
+    "google-auth>=2.35.0",
+    "google-api-python-client>=2.150.0",
+    "starlette>=0.40.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.scripts]
+mafe-agentic = "mafe_agentic.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mafe_agentic"]
