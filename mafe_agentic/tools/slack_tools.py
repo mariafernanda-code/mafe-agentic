@@ -17,10 +17,20 @@ from __future__ import annotations
 
 import logging
 import os
+import unicodedata
 
 from slack_sdk.web.async_client import AsyncWebClient
 
 log = logging.getLogger(__name__)
+
+
+def _normalize(text: str) -> str:
+    """Quita acentos y pasa a minúsculas para búsqueda flexible."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", text)
+    no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return no_accents.lower().strip()
 
 
 def _client() -> AsyncWebClient:
@@ -80,39 +90,90 @@ async def lookup_users(
 ) -> dict:
     """
     Busca usuarios en el workspace por nombre, display name o email parcial.
-    Devuelve la lista con id, real_name, display_name, email.
-    Útil para encontrar el correo de "Christian Hernandez" cuando vas a agendar
-    una junta con él.
+    - Normaliza texto: ignora acentos y mayúsculas/minúsculas
+    - Pagina users.list para workspaces grandes (>200 personas)
+    - Soporta búsquedas parciales: "Christian" matches "Christian Hernández"
+    - Devuelve TODOS los matches para que Claude pueda elegir o pedir aclaración
     """
     client = _client()
-    resp = await client.users_list(limit=200)
-    if not resp.get("ok"):
-        raise RuntimeError(f"Slack rechazó users.list: {resp.get('error')}")
 
-    q = (query or "").lower().strip()
+    q_norm = _normalize(query)
+    # También permitir match por palabras individuales (ej. "Christian Hernandez" → ["christian", "hernandez"])
+    q_words = [w for w in q_norm.split() if len(w) >= 2]
+
     matches = []
-    for u in resp.get("members", []):
-        if u.get("deleted") or u.get("is_bot"):
-            continue
-        profile = u.get("profile", {})
-        candidates = [
-            u.get("name", ""),
-            u.get("real_name", ""),
-            profile.get("real_name", ""),
-            profile.get("display_name", ""),
-            profile.get("email", ""),
-        ]
-        text = " ".join(candidates).lower()
-        if q in text:
-            matches.append({
-                "id": u.get("id"),
-                "name": u.get("real_name") or profile.get("real_name") or u.get("name"),
-                "display_name": profile.get("display_name"),
-                "email": profile.get("email"),
-            })
-            if len(matches) >= limit:
-                break
-    return {"query": query, "count": len(matches), "users": matches}
+    cursor = ""
+    pages = 0
+    total_users_seen = 0
+
+    while pages < 10:  # safety limit, max 10 páginas = ~2000 usuarios
+        resp = await client.users_list(limit=200, cursor=cursor) if cursor else await client.users_list(limit=200)
+        if not resp.get("ok"):
+            raise RuntimeError(f"Slack rechazó users.list: {resp.get('error')}")
+
+        for u in resp.get("members", []):
+            total_users_seen += 1
+            if u.get("deleted") or u.get("is_bot") or u.get("id") == "USLACKBOT":
+                continue
+            profile = u.get("profile", {})
+            candidates_raw = " ".join([
+                u.get("name", ""),
+                u.get("real_name", ""),
+                profile.get("real_name", ""),
+                profile.get("display_name", ""),
+                profile.get("display_name_normalized", ""),
+                profile.get("first_name", ""),
+                profile.get("last_name", ""),
+                profile.get("email", ""),
+            ])
+            text_norm = _normalize(candidates_raw)
+            # Match si el query completo está, O si TODAS las palabras del query están
+            full_match = q_norm and q_norm in text_norm
+            words_match = q_words and all(w in text_norm for w in q_words)
+            if full_match or words_match:
+                matches.append({
+                    "id": u.get("id"),
+                    "name": u.get("real_name") or profile.get("real_name") or u.get("name"),
+                    "display_name": profile.get("display_name"),
+                    "email": profile.get("email"),
+                    "title": profile.get("title"),
+                })
+                if len(matches) >= limit:
+                    break
+
+        if len(matches) >= limit:
+            break
+
+        cursor = resp.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+        pages += 1
+
+    log.info(
+        "lookup_users query=%r → %d matches (revisé %d usuarios, %d páginas)",
+        query, len(matches), total_users_seen, pages + 1,
+    )
+
+    note = ""
+    if len(matches) == 0:
+        note = (
+            f"No encontré a nadie que matche '{query}'. Pídele a quien te invocó "
+            f"el correo directo (algo como 'pasame su email') para poder agendar."
+        )
+    elif len(matches) > 1:
+        note = (
+            f"Encontré {len(matches)} personas. Antes de actuar, lista las opciones "
+            f"a quien te invocó y pregúntale cuál."
+        )
+    elif len(matches) == 1:
+        email = matches[0].get("email")
+        if email and (email.count(".") > 1 or len(email.split("@")[0]) > 12):
+            note = (
+                f"El email del perfil ({email}) se ve largo o con varios puntos. "
+                f"Antes de usarlo, confírmaselo a quien te invocó."
+            )
+
+    return {"query": query, "count": len(matches), "users": matches, "note": note}
 
 
 # ----- Tool: buscar en workspace -----
