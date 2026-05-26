@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-Mafe Agentic — MCP server hospedado y multi-usuario.
+Mafe Agentic — servidor en Railway que vive en Slack y también expone MCP.
 
-Hospedado en Railway, accesible vía HTTP desde cualquier cliente MCP
-(Cowork, Claude Desktop, Claude Code, conectores de Agentforce/Slack).
+Una sola app Starlette que sirve tres cosas:
+    POST /slack/events  → Slack Events API (app_mention, etc.)
+    POST /mcp           → MCP HTTP transport (Cowork/Claude Desktop)
+    GET  /              → healthcheck simple
 
-Multi-usuario: usa Service Account + Domain-Wide Delegation. Cuando un
-request llega, identifica al usuario por el header X-Mafe-User-Email
-y actúa como esa persona. Los archivos quedan en el Drive de quien
-los pidió.
+Multi-usuario: cada @mención en Slack identifica al invocador por su correo
+de Workspace, y todas las acciones (Drive, Calendar) se hacen con esa
+identidad via Domain-Wide Delegation.
 
 Variables de entorno (Railway):
-    GOOGLE_SERVICE_ACCOUNT_JSON  — JSON completo del service account (obligatorio)
-    MAFE_DEFAULT_USER            — correo a impersonar si el request no trae header (opcional)
-    PORT                          — Railway lo inyecta automáticamente
-    HOST                          — 0.0.0.0 por default
+    ANTHROPIC_API_KEY            — para llamar a Claude
+    SLACK_BOT_TOKEN              — xoxb-... bot token de la Slack App
+    SLACK_SIGNING_SECRET         — para verificar firma de Slack
+    SLACK_USER_TOKEN             — opcional, xoxp-... para search.messages
+    GOOGLE_SERVICE_ACCOUNT_JSON  — JSON del service account con DWD
+    MAFE_DEFAULT_USER            — fallback de identidad si no hay header (MCP)
+    PORT                         — inyectado por Railway
 """
 
 from __future__ import annotations
 
 import contextvars
+import logging
 import os
 import tempfile
 import uuid
@@ -28,15 +33,21 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 from mafe_agentic import drive
 from mafe_agentic.generators import chart, diagram, pptx, xlsx
+from mafe_agentic.slack_handler import slack_events_endpoint
+
+log = logging.getLogger(__name__)
 
 
-# ----- Contexto por request: usuario actual -----
+# ----- Contexto por request (para MCP) -----
 
 current_user: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "current_user", default=None
@@ -44,7 +55,7 @@ current_user: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 
 class UserContextMiddleware(BaseHTTPMiddleware):
-    """Extrae el usuario del header X-Mafe-User-Email y lo pone en contexto."""
+    """Extrae el usuario del header X-Mafe-User-Email (solo para path /mcp)."""
 
     async def dispatch(self, request: Request, call_next):
         user = request.headers.get("x-mafe-user-email") or request.headers.get(
@@ -59,24 +70,19 @@ class UserContextMiddleware(BaseHTTPMiddleware):
 
 
 def _user() -> str | None:
-    """Recupera el usuario del contexto actual."""
     return current_user.get()
 
 
-# ----- MCP server -----
+# ----- MCP server (igual que antes — para Cowork/Claude Desktop) -----
 
 mcp = FastMCP(
     "mafe_agentic",
     instructions=(
         "Mafe Agentic crea presentaciones, hojas de cálculo, gráficos y "
-        "diagramas en el Google Drive del usuario que la invoca. Pásale el "
-        "correo del usuario en el header X-Mafe-User-Email para que sepa "
-        "en qué Drive crear las cosas."
+        "diagramas en el Google Drive del usuario que la invoca."
     ),
 )
 
-
-# ----- Helpers -----
 
 def _temp_path(prefix: str, extension: str) -> Path:
     safe = "".join(c for c in prefix if c.isalnum() or c in "-_") or "mafe"
@@ -88,23 +94,19 @@ def _temp_path(prefix: str, extension: str) -> Path:
 def _ok(tipo: str, info: dict, extra: str = "") -> str:
     nota = f"\n{extra}" if extra else ""
     return (
-        f"Listo. Te dejé el {tipo} en tu Drive:\n\n"
+        f"Listo. Te dejé el {tipo} en tu Drive de Golden Gate Grid:\n\n"
         f"  {info['name']}\n"
         f"  {info['url']}\n"
-        f"{nota}\n\n"
-        f"Está en la carpeta 'Mafe Agentic' de tu Drive."
+        f"{nota}"
     )
 
 
 def _ups(action: str, e: Exception) -> str:
     return (
         f"Uy, algo se me atravesó {action}. "
-        f"El detalle técnico: {type(e).__name__}: {e}. "
-        f"Si quieres lo intentamos de otra forma, dime."
+        f"Detalle técnico: {type(e).__name__}: {e}."
     )
 
-
-# ----- Modelos de input -----
 
 class ChartInSlide(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -117,85 +119,69 @@ class ChartInSlide(BaseModel):
 class Slide(BaseModel):
     model_config = ConfigDict(extra="forbid")
     heading: str = Field(description="Título de la slide")
-    bullets: list[str] | None = Field(default=None, description="Bullets, uno por idea")
+    bullets: list[str] | None = Field(default=None, description="Bullets")
     notes: str | None = Field(default=None, description="Notas del presentador")
-    chart: ChartInSlide | None = Field(default=None, description="Gráfico embebido opcional")
+    chart: ChartInSlide | None = Field(default=None)
 
 
 class GenerarPresentacionInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    title: str = Field(description="Título de la portada", min_length=1, max_length=200)
-    subtitle: str | None = Field(default=None, description="Subtítulo opcional")
-    slides: list[Slide] = Field(description="Slides en orden", min_length=1, max_length=40)
-    filename_hint: str | None = Field(default=None, description="Sugerencia de nombre")
+    title: str = Field(min_length=1, max_length=200)
+    subtitle: str | None = None
+    slides: list[Slide] = Field(min_length=1, max_length=40)
+    filename_hint: str | None = None
 
 
 class Sheet(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(description="Nombre de la pestaña", max_length=31)
-    headers: list[str] = Field(description="Encabezados de columnas")
-    rows: list[list[Any]] = Field(description="Filas de datos")
-    totals_row: bool = Field(default=False, description="Si True, agrega fila TOTAL con SUM")
+    name: str = Field(max_length=31)
+    headers: list[str]
+    rows: list[list[Any]]
+    totals_row: bool = False
 
 
 class GenerarSheetsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    sheets: list[Sheet] = Field(description="Hojas a crear", min_length=1, max_length=20)
-    filename_hint: str | None = Field(default=None, description="Sugerencia de nombre")
+    sheets: list[Sheet] = Field(min_length=1, max_length=20)
+    filename_hint: str | None = None
 
 
 class GenerarGraficoInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    type: Literal["bar", "line", "pie"] = Field(description="bar / line / pie")
-    labels: list[str] = Field(description="Etiquetas")
-    values: list[float] = Field(description="Valores numéricos")
-    title: str | None = Field(default=None, description="Título")
-    x_label: str | None = Field(default=None, description="Eje X (no aplica a pie)")
-    y_label: str | None = Field(default=None, description="Eje Y (no aplica a pie)")
-    filename_hint: str | None = Field(default=None, description="Sugerencia de nombre")
+    type: Literal["bar", "line", "pie"]
+    labels: list[str]
+    values: list[float]
+    title: str | None = None
+    x_label: str | None = None
+    y_label: str | None = None
+    filename_hint: str | None = None
 
 
 class FlowNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: str = Field(description="Identificador único")
-    label: str = Field(description="Texto del nodo")
-    shape: Literal["box", "ellipse", "diamond"] = Field(default="box")
+    id: str
+    label: str
+    shape: Literal["box", "ellipse", "diamond"] = "box"
 
 
 class FlowEdge(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    from_node: str = Field(alias="from", description="ID nodo origen")
-    to: str = Field(description="ID nodo destino")
-    label: str | None = Field(default=None, description="Texto sobre la flecha")
+    from_node: str = Field(alias="from")
+    to: str
+    label: str | None = None
 
 
 class GenerarDiagramaInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", populate_by_name=True)
-    title: str | None = Field(default=None, description="Título del diagrama")
-    nodes: list[FlowNode] = Field(description="Pasos/decisiones", min_length=1, max_length=50)
-    edges: list[FlowEdge] = Field(description="Conexiones", min_length=1, max_length=100)
-    filename_hint: str | None = Field(default=None, description="Sugerencia de nombre")
+    title: str | None = None
+    nodes: list[FlowNode] = Field(min_length=1, max_length=50)
+    edges: list[FlowEdge] = Field(min_length=1, max_length=100)
+    filename_hint: str | None = None
 
 
-# ----- Tools -----
-
-@mcp.tool(
-    name="generar_presentacion",
-    annotations={
-        "title": "Generar presentación en Google Slides",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
+@mcp.tool(name="generar_presentacion")
 async def generar_presentacion(params: GenerarPresentacionInput) -> str:
-    """
-    Crea una presentación nativa de Google Slides en el Drive del usuario.
-
-    Cada slide puede llevar heading, bullets, notas del presentador y un
-    gráfico opcional embebido. Bonita y lista para presentar.
-    """
+    """Crea presentación nativa de Google Slides en el Drive del usuario."""
     user = _user()
     local_path = None
     try:
@@ -220,7 +206,7 @@ async def generar_presentacion(params: GenerarPresentacionInput) -> str:
             user_email=user,
             convert_to_google=True,
         )
-        return _ok("deck", info, f"Total: {len(params.slides)} slides en Google Slides.")
+        return _ok("deck", info, f"Total: {len(params.slides)} slides.")
     except Exception as e:
         return _ups("armando la presentación", e)
     finally:
@@ -231,21 +217,9 @@ async def generar_presentacion(params: GenerarPresentacionInput) -> str:
                 pass
 
 
-@mcp.tool(
-    name="generar_sheets",
-    annotations={
-        "title": "Generar Google Sheets",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
+@mcp.tool(name="generar_sheets")
 async def generar_sheets(params: GenerarSheetsInput) -> str:
-    """
-    Crea un Google Sheets nativo con varias hojas, encabezados con formato
-    y opcionalmente fila TOTAL con fórmulas SUM. Va al Drive del usuario.
-    """
+    """Crea Google Sheets con varias hojas en el Drive del usuario."""
     user = _user()
     local_path = None
     try:
@@ -270,21 +244,9 @@ async def generar_sheets(params: GenerarSheetsInput) -> str:
                 pass
 
 
-@mcp.tool(
-    name="generar_grafico",
-    annotations={
-        "title": "Generar gráfico PNG en Drive",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
+@mcp.tool(name="generar_grafico")
 async def generar_grafico(params: GenerarGraficoInput) -> str:
-    """
-    Genera un gráfico PNG (bar/line/pie) y lo sube al Drive del usuario.
-    Sirve para insertar en presentaciones, correos o documentos.
-    """
+    """Genera gráfico PNG y lo sube al Drive del usuario."""
     user = _user()
     local_path = None
     try:
@@ -307,21 +269,9 @@ async def generar_grafico(params: GenerarGraficoInput) -> str:
                 pass
 
 
-@mcp.tool(
-    name="generar_diagrama_flujo",
-    annotations={
-        "title": "Generar diagrama de flujo PNG en Drive",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
+@mcp.tool(name="generar_diagrama_flujo")
 async def generar_diagrama_flujo(params: GenerarDiagramaInput) -> str:
-    """
-    Dibuja un diagrama de flujo con cajas, rombos de decisión, elipses
-    y flechas. Lo sube como PNG al Drive del usuario.
-    """
+    """Diagrama de flujo PNG en Drive."""
     user = _user()
     local_path = None
     try:
@@ -352,28 +302,62 @@ async def generar_diagrama_flujo(params: GenerarDiagramaInput) -> str:
                 pass
 
 
-# ----- ASGI app con middleware de usuario -----
+# ----- Healthcheck simple -----
 
-def get_app():
-    """Construye la app ASGI lista para servir con HTTP streamable."""
-    app = mcp.streamable_http_app()
-    # Envolver con middleware para extraer usuario del header
-    from starlette.applications import Starlette
-    wrapped = Starlette(
-        routes=app.routes,
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "service": "mafe-agentic",
+        "endpoints": ["/mcp", "/slack/events"],
+    })
+
+
+# ----- App principal -----
+
+def get_app() -> Starlette:
+    """
+    Construye la app ASGI completa con todos los endpoints.
+
+    Estructura:
+        /                  → healthcheck
+        /slack/events      → Slack Events API
+        /mcp               → MCP HTTP transport (con UserContextMiddleware)
+    """
+    mcp_inner = mcp.streamable_http_app()
+
+    # App MCP con middleware (solo aplica al sub-mount /mcp)
+    mcp_app = Starlette(
+        routes=mcp_inner.routes,
         middleware=[Middleware(UserContextMiddleware)],
-        lifespan=app.router.lifespan_context,
+        lifespan=mcp_inner.router.lifespan_context,
     )
-    return wrapped
 
+    routes = [
+        Route("/", health, methods=["GET"]),
+        Route("/slack/events", slack_events_endpoint, methods=["POST"]),
+        Mount("/mcp", app=mcp_app),
+    ]
 
-# ----- Entry point -----
+    app = Starlette(routes=routes, lifespan=mcp_inner.router.lifespan_context)
+    return app
+
 
 def main() -> None:
-    """Arranca el servidor HTTP. Railway inyecta PORT."""
+    """Arranca Uvicorn. Railway inyecta PORT."""
     import uvicorn
+
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+
     port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "0.0.0.0")
+    log.info("Mafe Agentic arrancando en %s:%d", host, port)
+    log.info("  POST /slack/events  ← Slack Events")
+    log.info("  POST /mcp           ← MCP HTTP")
+    log.info("  GET  /              ← healthcheck")
+
     uvicorn.run(
         get_app(),
         host=host,
