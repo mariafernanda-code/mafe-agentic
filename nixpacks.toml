@@ -4,7 +4,7 @@
 nixPkgs = ["python311", "python311Packages.pip", "graphviz", "gcc"]
 
 [phases.install]
-cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip setuptools wheel hatchling", "/opt/venv/bin/pip install -e ."]
+cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip", "/opt/venv/bin/pip install mcp pydantic python-pptx openpyxl matplotlib graphviz google-auth google-api-python-client starlette uvicorn"]
 
 [start]
 cmd = "/opt/venv/bin/python -m mafe_agentic.server"
