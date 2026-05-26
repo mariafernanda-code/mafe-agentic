@@ -69,26 +69,48 @@ async def list_events(
 async def find_free_slots(
     *, user_email: str, duration_minutes: int = 30, days_ahead: int = 5,
     work_start_hour: int = 9, work_end_hour: int = 18,
+    attendees: list[str] | None = None,
 ) -> dict:
     """
-    Devuelve slots libres en el calendario, respetando horario de trabajo.
-    Hace freebusy query para detectar bloqueos.
+    Devuelve slots libres comunes entre el invocador Y los attendees pedidos.
+    Útil para planear juntas: pasa los correos de los asistentes y devuelve
+    huecos donde TODOS están libres.
+
+    En Google Workspace los miembros del dominio pueden ver el free/busy
+    de otros miembros del dominio por default.
     """
     svc = _calendar_service(user_email)
     now = datetime.now(timezone.utc)
     end = now + timedelta(days=days_ahead)
 
+    # Construir items para freebusy: el usuario + attendees
+    emails_to_check = [user_email]
+    if attendees:
+        for email in attendees:
+            if email and email not in emails_to_check:
+                emails_to_check.append(email)
+
     fb = svc.freebusy().query(body={
         "timeMin": _iso(now),
         "timeMax": _iso(end),
-        "items": [{"id": "primary"}],
+        "items": [{"id": e} for e in emails_to_check],
     }).execute()
-    busy = fb.get("calendars", {}).get("primary", {}).get("busy", [])
-    busy_periods = [
-        (datetime.fromisoformat(b["start"].replace("Z", "+00:00")),
-         datetime.fromisoformat(b["end"].replace("Z", "+00:00")))
-        for b in busy
-    ]
+
+    calendars = fb.get("calendars", {})
+
+    # Verificar errores por calendario (a veces el bot puede no tener acceso)
+    errors_by_email = {}
+    busy_periods = []
+    for email in emails_to_check:
+        cal_data = calendars.get(email, {})
+        errors = cal_data.get("errors", [])
+        if errors:
+            errors_by_email[email] = [e.get("reason") for e in errors]
+        for b in cal_data.get("busy", []):
+            busy_periods.append((
+                datetime.fromisoformat(b["start"].replace("Z", "+00:00")),
+                datetime.fromisoformat(b["end"].replace("Z", "+00:00")),
+            ))
 
     slots = []
     cursor = now.replace(minute=0, second=0, microsecond=0)
@@ -108,7 +130,18 @@ async def find_free_slots(
             })
         cursor += timedelta(minutes=30)
 
-    return {"duration_minutes": duration_minutes, "slots": slots}
+    result = {
+        "duration_minutes": duration_minutes,
+        "slots": slots,
+        "calendars_checked": emails_to_check,
+    }
+    if errors_by_email:
+        result["errors_by_email"] = errors_by_email
+        result["note"] = (
+            "Algunos calendarios devolvieron errores (probablemente no compartidos contigo). "
+            "Los slots devueltos solo consideran los calendarios accesibles."
+        )
+    return result
 
 
 # ----- Tool: crear evento con Meet -----
@@ -240,12 +273,21 @@ SPECS = [
     },
     {
         "name": "calendar_find_free_slots",
-        "description": "Encuentra slots libres en el calendario del usuario, respetando horario laboral (9-18h L-V).",
+        "description": (
+            "Encuentra slots libres COMUNES entre el invocador y otras personas. "
+            "Si pasas attendees, devuelve slots donde TODOS están libres. "
+            "Si no, solo del invocador. Respeta horario laboral (9-18h L-V)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "duration_minutes": {"type": "integer", "default": 30},
                 "days_ahead": {"type": "integer", "default": 5},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lista de correos de las personas con las que se quiere coordinar. Mafe revisará su free/busy y solo devolverá huecos donde todos estén libres.",
+                },
             },
         },
     },
