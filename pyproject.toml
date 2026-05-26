@@ -1,12 +1,15 @@
 [project]
 name = "mafe-agentic"
-version = "0.1.0"
-description = "Mafe Agentic: el MCP server agéntico de Golden Gate Grid. Multi-usuario, hospedado, con todo el poder de Mariana ahora servido como API."
+version = "0.2.0"
+description = "Mafe Agentic: la asistente de Golden Gate Grid que vive en Slack y también atiende como MCP server."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Golden Gate Grid" }]
 dependencies = [
     "mcp>=1.2.0",
+    "anthropic>=0.39.0",
+    "slack-bolt>=1.21.0",
+    "slack-sdk>=3.33.0",
     "pydantic>=2.5.0",
     "python-pptx>=1.0.2",
     "openpyxl>=3.1.5",
@@ -16,6 +19,8 @@ dependencies = [
     "google-api-python-client>=2.150.0",
     "starlette>=0.40.0",
     "uvicorn>=0.32.0",
+    "httpx>=0.27.0",
+    "aiohttp>=3.10.0",
 ]
 
 [project.scripts]
