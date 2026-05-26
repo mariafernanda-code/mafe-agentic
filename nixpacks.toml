@@ -1,11 +1,10 @@
 # Configuracion de build para Railway/Nixpacks.
-# Incluye graphviz a nivel sistema para los diagramas de flujo.
 
 [phases.setup]
 nixPkgs = ["python311", "python311Packages.pip", "graphviz", "gcc"]
 
 [phases.install]
-cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip", "/opt/venv/bin/pip install -e ."]
+cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip setuptools wheel hatchling", "/opt/venv/bin/pip install -e ."]
 
 [start]
 cmd = "/opt/venv/bin/python -m mafe_agentic.server"
